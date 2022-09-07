@@ -1,6 +1,6 @@
 beir==1.0.0
 faiss-cpu==1.7.2
-pytorch-lightning==1.5.10
+pytorch-lightning==1.6.0
 sentence-transformers==2.2.0
 torch==1.12.1
 transformers==4.17.0
