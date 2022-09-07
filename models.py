@@ -5,7 +5,6 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from train import Specter, mean_pooling
-from train_scibert import scibertSpecter
 
 
 class BaseEvalModel:
