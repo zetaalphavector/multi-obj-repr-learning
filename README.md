@@ -5,7 +5,7 @@
 ## Download data
 To download the training data and the ICLR2022 benchmark for our S3 bucket, run `download_data.sh`:
 ```
-./source download_data.sh
+source download_data.sh
 ```
 
 ## Training
