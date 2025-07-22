@@ -142,7 +142,6 @@ class Specter(pl.LightningModule):
             num_warmup_steps=self.hparams.warmup_steps,
             num_training_steps=self.total_steps,
         )
-        scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
         return scheduler
 
     def configure_optimizers(self):
@@ -193,9 +192,7 @@ class Specter(pl.LightningModule):
         neg_embedding = self.forward(**batch[2])
 
         loss = self.objective(source_embedding, pos_embedding, neg_embedding)
-
-        lr_scheduler = self.trainer.lr_schedulers[0]["scheduler"]
-
+        lr_scheduler = self.lr_schedulers()
         self.log(
             "train_loss",
             loss,
@@ -218,46 +215,56 @@ class Specter(pl.LightningModule):
         source_embedding = self.forward(**batch[0])
         pos_embedding = self.forward(**batch[1])
         neg_embedding = self.forward(**batch[2])
-
         loss = self.objective(source_embedding, pos_embedding, neg_embedding)
+        dataset_name = self.idx_to_val_dataset[dataloader_idx][0]
         self.log(
-            f"val_loss/{self.idx_to_val_dataset[dataloader_idx][0]}",
+            f"val_loss/{dataset_name}",
             loss,
             on_step=True,
             on_epoch=False,
             add_dataloader_idx=False,
         )
-        return {f"val_loss_{self.idx_to_val_dataset[dataloader_idx][0]}": loss}
+        # Manually accumulate outputs for aggregation.
+        if not hasattr(self, "_val_outputs"):
+            self._val_outputs = {}
+        self._val_outputs.setdefault(dataloader_idx, []).append(loss.detach())
 
-    def _compute_avg_val_losses(self, outputs) -> dict:
-        if not isinstance(outputs[0], list):  # single validation dataloader
-            outputs = [outputs]
-
+    def _compute_avg_val_losses(self) -> dict:
         results = {}
-        for idx, (name, _) in self.idx_to_val_dataset.items():
-            avg_loss = torch.stack([x[f"val_loss_{name}"] for x in outputs[idx]]).mean()
-            results[name] = avg_loss
-            self.logger.experiment.add_scalars(
-                "avg_val_loss", {name: results[name]}, self.global_step
+        for idx, (name, size) in self.idx_to_val_dataset.items():
+            losses = self._val_outputs.get(idx, [])
+            if losses:
+                avg_loss = torch.stack(losses).mean()
+                results[name] = avg_loss.item()
+                self.logger.experiment.add_scalars(
+                    "avg_val_loss", {name: results[name]}, self.global_step
+                )
+        total = sum(
+            size
+            for _, (name, size) in self.idx_to_val_dataset.items()
+            if name in results
+        )
+        if total > 0:
+            weighted = sum(
+                results[name] * size
+                for _, (name, size) in self.idx_to_val_dataset.items()
+                if name in results
             )
-
-        for k, v in results.items():
-            if isinstance(v, torch.Tensor):
-                results[k] = v.detach().cpu().item()
-
-        avg_val_loss = sum(
-            results[name] * size for _, (name, size) in self.idx_to_val_dataset.items()
-        ) / sum(size for _, (_, size) in self.idx_to_val_dataset.items())
-        results["mean"] = avg_val_loss
+            results["mean"] = weighted / total
+        else:
+            results["mean"] = None
         return results
 
-    def validation_epoch_end(self, outputs: list) -> dict:
-        avg_val_losses = self._compute_avg_val_losses(outputs)
-
-        self.log("avg_val_loss", avg_val_losses["mean"], on_epoch=True, prog_bar=True)
-        self.logger.experiment.add_scalars(
-            "avg_val_loss", {"mean": avg_val_losses["mean"]}, self.global_step
-        )
+    def on_validation_epoch_end(self) -> None:
+        avg_val_losses = self._compute_avg_val_losses()
+        if avg_val_losses.get("mean") is not None:
+            self.log(
+                "avg_val_loss", avg_val_losses["mean"], on_epoch=True, prog_bar=True
+            )
+            self.logger.experiment.add_scalars(
+                "avg_val_loss", {"mean": avg_val_losses["mean"]}, self.global_step
+            )
+        self._val_outputs = {}
 
 
 def parse_args():
@@ -335,7 +342,6 @@ def get_train_params(args):
     train_params = {}
     train_params["precision"] = 16 if args.fp16 else 32
     train_params["accumulate_grad_batches"] = args.grad_accum
-    train_params["track_grad_norm"] = -1
     train_params["limit_val_batches"] = args.limit_val_batches
 
     if (
@@ -348,7 +354,14 @@ def get_train_params(args):
     train_params["max_steps"] = -1 if args.steps is None else args.steps
     train_params["max_epochs"] = args.epochs
     train_params["log_every_n_steps"] = 1
-    train_params["gpus"] = args.gpus
+
+    if torch.cuda.is_available():
+        train_params["accelerator"] = "gpu"
+        train_params["devices"] = args.gpus
+    else:
+        train_params["accelerator"] = "cpu"
+        train_params["devices"] = 1
+
     if args.fast_dev_run:
         train_params["fast_dev_run"] = args.fast_dev_run
     return train_params
